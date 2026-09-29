@@ -33,6 +33,7 @@ import pyrogram
 from pyrogram import utils
 from pyrogram import raw
 from pyrogram.connection import Connection, transport_error
+from pyrogram.connection.proxy import client_proxy_address
 from pyrogram.crypto.executor import get_crypto_executor
 from pyrogram.errors import (
     RPCError, InternalServerError, AuthKeyDuplicated, FloodWait, FloodPremiumWait, ServiceUnavailable,
@@ -158,6 +159,7 @@ class Session:
         self._start_active = False
         self._start_completed = asyncio.Event()
         self._stopping = False
+        self._closed = False
 
         try:
             self.loop = asyncio.get_running_loop()
@@ -176,6 +178,10 @@ class Session:
         try:
             while True:
                 attempt += 1
+
+                if self._closed:
+                    return
+
                 self._stopping = False
                 self._teardown_started = False
                 self._skew_breaches = 0
@@ -202,6 +208,16 @@ class Session:
 
                     await self.send(raw.functions.Ping(ping_id=0), timeout=handshake_timeout)
 
+                    # Telegram wants to know which proxy a client sits behind.
+                    proxy_address = client_proxy_address(self.client.proxy)
+                    client_proxy = None
+
+                    if proxy_address is not None:
+                        client_proxy = raw.types.InputClientProxy(
+                            address=proxy_address.hostname,
+                            port=proxy_address.port
+                        )
+
                     if not self.is_cdn:
                         await self.send(
                             raw.functions.InvokeWithLayer(
@@ -220,6 +236,7 @@ class Session:
                                         if self.client.init_connection_params
                                         else None
                                     ),
+                                    proxy=client_proxy,
                                 )
                             ),
                             timeout=handshake_timeout
@@ -232,10 +249,13 @@ class Session:
                     log.info("System: %s (%s)", self.client.system_version, self.client.lang_code)
                 except AuthKeyDuplicated as e:
                     self._start_exc = e
-                    await self.stop()
+                    await self._stop()
                     raise e
                 except (FloodWait, FloodPremiumWait) as e:
-                    await self.stop()
+                    await self._stop()
+
+                    if self._closed:
+                        return
 
                     if max_attempts is not None and attempt >= max_attempts:
                         self._start_exc = e
@@ -250,7 +270,10 @@ class Session:
                     )
                     await asyncio.sleep(backoff)
                 except (InternalServerError, ServiceUnavailable, TimeoutError, OSError) as e:
-                    await self.stop()
+                    await self._stop()
+
+                    if self._closed:
+                        return
 
                     if max_attempts is not None and attempt >= max_attempts:
                         self._start_exc = e
@@ -264,14 +287,18 @@ class Session:
                     await asyncio.sleep(backoff)
                 except RPCError as e:
                     self._start_exc = e
-                    await self.stop()
+                    await self._stop()
                     raise
                 except (Exception, asyncio.CancelledError) as e:
                     self._start_exc = e
-                    await self.stop()
+                    await self._stop()
                     raise e
                 else:
                     break
+
+            if self._closed:
+                await self._stop()
+                return
 
             self.is_started.set()
 
@@ -287,6 +314,11 @@ class Session:
                 log.exception(e)
 
     async def stop(self):
+        self._closed = True
+
+        await self._stop()
+
+    async def _stop(self):
         self.is_started.clear()
         self._stopping = True
 
@@ -340,13 +372,20 @@ class Session:
         return self._restart_lock.locked() or self._start_active
 
     async def restart(self):
+        if self._closed:
+            return
+
         if self._restart_lock.locked():
             await self._restart_done.wait()
             return
         async with self._restart_lock:
             self._restart_done.clear()
             try:
-                await self.stop()
+                await self._stop()
+
+                if self._closed:
+                    return
+
                 if getattr(self.client.storage, "conn", True) is None:
                     await self.client.storage.open()
                 await self.start(max_attempts=self.MAX_RETRIES)
@@ -730,6 +769,9 @@ class Session:
         if self._start_active:
             await self._start_completed.wait()
 
+        if self._closed:
+            raise ConnectionError("Session is stopped")
+
         if not self.is_started.is_set():
             await self.restart()
 
@@ -760,12 +802,15 @@ class Session:
     ):
         slept = 0.0
         flood_budget = sleep_threshold * Session.MAX_RETRIES
+        retries = max(1, retries)
 
         while retries > 0:
             if not self.is_started.is_set():
                 await self._wait_started()
 
-            if isinstance(query, (raw.functions.InvokeWithoutUpdates, raw.functions.InvokeWithTakeout)):
+            if isinstance(query, (raw.functions.InvokeWithoutUpdates,
+                                  raw.functions.InvokeWithTakeout,
+                                  raw.functions.InvokeWithReCaptcha)):
                 inner_query = query.query
             else:
                 inner_query = query
